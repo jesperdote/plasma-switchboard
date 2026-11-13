@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""widgetctl: hide and show Plasma panel widgets, live, without removing them.
+
+It drives Panel Colorizer's "Hide widgets" feature (its `hiddenWidgets` setting) through
+plasmashell's scripting D-Bus API. A hidden widget keeps its place and all its settings;
+nothing is removed or re-added, so showing it again is exact.
+
+Each panel needs a Panel Colorizer widget on it: panels without one are listed but their
+widgets can't be hidden.
+
+  widgetctl list [--json]          every panel widget, its name and whether it is hidden
+  widgetctl hide NAME...           NAME = the name `list` shows, or the numeric widget id
+  widgetctl show NAME...
+  widgetctl toggle NAME...
+  widgetctl show-all
+  widgetctl preset                 list presets (and which one matches right now)
+  widgetctl preset NAME            hide exactly the preset's widgets, show the rest
+  widgetctl preset save NAME       save what is hidden right now as a preset
+  widgetctl preset delete NAME
+
+Presets live in ~/.config/widgetctl/presets.json as {"name": {"hidden": [names]}}.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+COLORIZER = "luisbocanegra.panel.colorizer"
+SELF = "com.github.jesperdote.switchboard"  # the panel popup: never offer to hide it
+PRESETS_FILE = os.path.expanduser("~/.config/widgetctl/presets.json")
+DEFAULT_PRESETS = {
+    "full": {"hidden": []},
+    "focus": {"hidden": ["solana-watchlist", "solana-wallet", "nba-scores",
+                         "claude-usage", "cpu-ram", "audio-visualizer"]},
+    "screen-share": {"hidden": ["solana-watchlist", "solana-wallet", "claude-usage"]},
+}
+
+# Collects every panel's widgets, in on-screen order, plus each panel's colorizer state.
+QUERY_JS = r"""
+var out = [];
+panels().forEach(function (p) {
+  p.currentConfigGroup = ["General"];
+  var order = String(p.readConfig("AppletOrder", "")).split(";").filter(function (s) { return s; });
+  var ws = p.widgets(), byId = {}, colorizer = null;
+  ws.forEach(function (w) { byId[w.id] = w; if (w.type == "%(colorizer)s") colorizer = w; });
+  ws.forEach(function (w) { if (order.indexOf(String(w.id)) < 0) order.push(String(w.id)); });
+  var list = [];
+  order.forEach(function (id) {
+    var w = byId[id]; if (!w) return;
+    var cmd = "";
+    if (w.type == "com.github.zren.commandoutput") {
+      w.currentConfigGroup = ["General"]; cmd = String(w.readConfig("command", ""));
+    }
+    list.push({id: w.id, plugin: w.type, command: cmd});
+  });
+  var hidden = "", titles = "";
+  if (colorizer) {
+    colorizer.currentConfigGroup = ["General"];
+    hidden = String(colorizer.readConfig("hiddenWidgets", ""));
+    titles = String(colorizer.readConfig("panelWidgets", ""));
+  }
+  out.push({id: p.id, location: p.location, screen: p.screen,
+            colorizer: colorizer ? colorizer.id : null,
+            hidden: hidden, titles: titles, widgets: list});
+});
+print(JSON.stringify(out));
+""" % {"colorizer": COLORIZER}
+
+# Fallback names when Panel Colorizer has no title for a plugin yet.
+FRIENDLY = {
+    "org.kde.plasma.kickoff": "launcher",
+    "org.kde.plasma.icontasks": "task-manager",
+    "luisbocanegra.audio.visualizer": "audio-visualizer",
+    "plasmusic-toolbar": "music",
+    "org.kde.plasma.digitalclock": "clock",
+    "org.kde.plasma.showdesktop": "peek-desktop",
+    "org.dhruv8sh.kara": "desktops",
+    "org.kde.plasma.systemtray": "system-tray",
+    "org.kde.plasma.weather": "weather",
+    "org.kde.plasma.notifications": "notifications",
+    "org.kde.plasma.marginsseparator": "separator",
+    "com.github.jesperdote.systemload": "cpu-ram",
+}
+
+
+def die(msg, code=1):
+    print(f"widgetctl: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run_js(script):
+    try:
+        r = subprocess.run(
+            ["qdbus6", "org.kde.plasmashell", "/PlasmaShell",
+             "org.kde.PlasmaShell.evaluateScript", script],
+            capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        die("qdbus6 not found")
+    except subprocess.TimeoutExpired:
+        die("plasmashell did not answer within 20 s")
+    if r.returncode != 0:
+        die(f"plasmashell scripting failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def load_state():
+    panels = json.loads(run_js(QUERY_JS))
+    widgets = []
+    for p in panels:
+        titles = {}
+        try:
+            for t in json.loads(p["titles"] or "[]"):
+                titles[t["id"]] = t.get("title") or ""
+        except ValueError:
+            pass
+        try:
+            hidden_cfg = json.loads(p["hidden"] or "{}").get("widgets", [])
+        except ValueError:
+            hidden_cfg = []
+        p["hidden_cfg"] = hidden_cfg
+        for w in p["widgets"]:
+            if w["plugin"] in (COLORIZER, SELF):
+                continue
+            if w["command"]:
+                base = slug(os.path.basename(w["command"].split()[0]))
+            else:
+                base = FRIENDLY.get(w["plugin"]) or slug(titles.get(w["id"], "")) \
+                    or slug(w["plugin"].split(".")[-1])
+            widgets.append({
+                "id": w["id"], "plugin": w["plugin"], "base": base,
+                "title": titles.get(w["id"], ""),
+                "panel": p["id"], "location": p["location"], "colorizer": p["colorizer"],
+                "hidden": any(h.get("id") == w["id"] and h.get("name") == w["plugin"]
+                              and h.get("hide") for h in hidden_cfg),
+            })
+    # Unique names: "weather"; a base that repeats gets its panel, then a counter.
+    where = {}
+    for w in widgets:
+        where.setdefault(w["base"], set()).add(w["location"])
+    seen = {}
+    for w in widgets:
+        name = w["base"] if len(where[w["base"]]) == 1 else f'{w["base"]}-{w["location"]}'
+        seen[name] = seen.get(name, 0) + 1
+        w["name"] = name if seen[name] == 1 else f"{name}-{seen[name]}"
+    return panels, widgets
+
+
+def resolve(widgets, names):
+    out = []
+    for n in names:
+        match = [w for w in widgets if w["name"] == n or str(w["id"]) == n]
+        if not match:
+            die(f"no widget called '{n}' (see: widgetctl list)", 2)
+        out.extend(match)
+    return out
+
+
+def apply(panels, widgets, want_hidden):
+    """want_hidden: set of widget ids that should be hidden; every other widget is shown."""
+    lines = []
+    for p in panels:
+        if p["colorizer"] is None:
+            missing = [w["name"] for w in widgets if w["panel"] == p["id"] and w["id"] in want_hidden]
+            if missing:
+                die(f"panel {p['id']} ({p['location']}) has no Panel Colorizer, can't hide: "
+                    + ", ".join(missing))
+            continue
+        mine = {w["id"]: w for w in widgets if w["panel"] == p["id"]}
+        # Keep entries for widgets we don't know about (e.g. ones Colorizer tracks we skip).
+        kept = [h for h in p["hidden_cfg"] if h.get("id") not in mine and h.get("hide")]
+        new = kept + [{"name": w["plugin"], "id": wid, "hide": True}
+                      for wid, w in mine.items() if wid in want_hidden]
+        def key(h):
+            return (h.get("id"), h.get("name"))
+        if sorted(map(key, new)) == sorted(key(h) for h in p["hidden_cfg"] if h.get("hide")):
+            continue
+        cfg = json.dumps({"widgets": new}, separators=(",", ":"))
+        lines.append(
+            "var c = panelById(%d).widgetById(%d); c.currentConfigGroup = ['General'];"
+            " c.writeConfig('hiddenWidgets', %s); c.reloadConfig();"
+            % (p["id"], p["colorizer"], json.dumps(cfg)))
+    if lines:
+        run_js("\n".join(lines))
+
+
+def load_presets():
+    if not os.path.exists(PRESETS_FILE):
+        os.makedirs(os.path.dirname(PRESETS_FILE), exist_ok=True)
+        save_presets(DEFAULT_PRESETS)
+    with open(PRESETS_FILE) as f:
+        return json.load(f)
+
+
+def save_presets(presets):
+    tmp = PRESETS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(presets, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, PRESETS_FILE)
+
+
+def current_preset(widgets, presets):
+    hidden = {w["name"] for w in widgets if w["hidden"]}
+    known = {w["name"] for w in widgets}
+    for name, p in presets.items():
+        if {n for n in p.get("hidden", []) if n in known} == hidden:
+            return name
+    return None
+
+
+def cmd_list(args):
+    panels, widgets = load_state()
+    presets = load_presets()
+    if "--json" in args:
+        print(json.dumps({
+            "panels": [{"id": p["id"], "location": p["location"],
+                        "controllable": p["colorizer"] is not None} for p in panels],
+            "widgets": [{k: w[k] for k in ("name", "id", "plugin", "title", "panel",
+                                           "location", "hidden")} for w in widgets],
+            "presets": sorted(presets),
+            "preset": current_preset(widgets, presets),
+        }))
+        return
+    for p in panels:
+        tag = "" if p["colorizer"] else "  (no Panel Colorizer: can't hide)"
+        print(f"{p['location']} panel{tag}")
+        for w in (w for w in widgets if w["panel"] == p["id"]):
+            mark = "hidden" if w["hidden"] else "shown "
+            print(f"  {mark}  {w['name']:<22} {w['title'] or w['plugin']}")
+
+
+def cmd_set(args, mode):
+    if not args:
+        die(f"usage: widgetctl {mode} NAME...", 2)
+    panels, widgets = load_state()
+    targets = {w["id"] for w in resolve(widgets, args)}
+    hidden = {w["id"] for w in widgets if w["hidden"]}
+    if mode == "hide":
+        hidden |= targets
+    elif mode == "show":
+        hidden -= targets
+    else:
+        hidden ^= targets
+    apply(panels, widgets, hidden)
+    for w in widgets:
+        if w["id"] in targets:
+            print(f"{w['name']}: {'hidden' if w['id'] in hidden else 'shown'}")
+
+
+def cmd_preset(args):
+    presets = load_presets()
+    if not args:
+        _, widgets = load_state()
+        cur = current_preset(widgets, presets)
+        for name, p in presets.items():
+            star = "*" if name == cur else " "
+            print(f"{star} {name:<14} hides: {', '.join(p.get('hidden', [])) or '(nothing)'}")
+        return
+    if args[0] == "save":
+        if len(args) != 2:
+            die("usage: widgetctl preset save NAME", 2)
+        _, widgets = load_state()
+        presets[args[1]] = {"hidden": [w["name"] for w in widgets if w["hidden"]]}
+        save_presets(presets)
+        print(f"saved preset '{args[1]}': hides {', '.join(presets[args[1]]['hidden']) or 'nothing'}")
+        return
+    if args[0] == "delete":
+        if len(args) != 2 or args[1] not in presets:
+            die("usage: widgetctl preset delete NAME (an existing preset)", 2)
+        del presets[args[1]]
+        save_presets(presets)
+        print(f"deleted preset '{args[1]}'")
+        return
+    name = args[0]
+    if name not in presets:
+        die(f"no preset '{name}' (have: {', '.join(presets)})", 2)
+    panels, widgets = load_state()
+    names = {w["name"] for w in widgets}
+    wanted = presets[name].get("hidden", [])
+    unknown = [n for n in wanted if n not in names]
+    if unknown:
+        print(f"note: not on the panels, skipped: {', '.join(unknown)}", file=sys.stderr)
+    apply(panels, widgets, {w["id"] for w in widgets if w["name"] in wanted})
+    print(f"preset '{name}' applied")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "list":
+        cmd_list(args)
+    elif cmd in ("hide", "show", "toggle"):
+        cmd_set(args, cmd)
+    elif cmd == "show-all":
+        panels, widgets = load_state()
+        apply(panels, widgets, set())
+        print("all widgets shown")
+    elif cmd == "preset":
+        cmd_preset(args)
+    else:
+        die(f"unknown command '{cmd}' (see: widgetctl --help)", 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

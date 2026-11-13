@@ -1,0 +1,26 @@
+# Tag a version (git tag v1.2.0 && git push --tags) to publish a GitHub release with the
+# installable .plasmoid file. The tag must match "Version" in package/metadata.json.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches metadata.json
+        run: |
+          version=$(jq -r .KPlugin.Version package/metadata.json)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but metadata.json says $version"; exit 1; }
+      - name: Build the .plasmoid
+        run: |
+          id=$(jq -r .KPlugin.Id package/metadata.json)
+          (cd package && zip -r -X "../$id.plasmoid" . -x '*/__pycache__/*')
+          echo "ASSET=$id.plasmoid" >> "$GITHUB_ENV"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ASSET" --title "$GITHUB_REF_NAME" --generate-notes

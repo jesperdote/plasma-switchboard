@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [{ "Name": "Jesper Dote", "Email": "jesperdote@gmail.com" }],
+        "Category": "System Information",
+        "Description": "Hide and show your panel widgets, or switch between presets, without removing them (uses Panel Colorizer's hide feature)",
+        "Icon": "visibility",
+        "Id": "com.github.jesperdote.switchboard",
+        "License": "GPL-3.0-or-later",
+        "Name": "Switchboard",
+        "Version": "1.0.1",
+        "Website": "https://github.com/jesperdote/plasma-switchboard"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
